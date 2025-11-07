@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Weekly Tidbits</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <?!= include('base') ?>
+</head>
+
+<body>
+  <div class="dashboard-container app-shell" id="appShell">
+    <div class="controls-bar">
+      <div class="filter-group">
+        <label for="bu-filter">Category:</label>
+        <select id="bu-filter">
+            <option value="">All</option>
+          </select>
+      </div>
+
+      <div class="filter-group" style="flex: 2 1 320px">
+        <label for="search-input">Search:</label>
+        <input
+            id="search-input"
+            type="text"
+            placeholder="Search title or content..."
+          />
+      </div>
+
+      <button class="refresh-btn" id="refresh-btn">
+          <span>↻</span> Refresh
+        </button>
+
+      <div class="view-toggle">
+        <button class="view-btn active" id="recent-btn">
+            <span>📅</span><span>Recent</span><span id="recent-badge"></span>
+          </button>
+        <button class="view-btn" id="archive-btn">
+            <span>📚</span><span>Archive</span><span id="archive-badge"></span>
+          </button>
+      </div>
+    </div>
+
+    <div class="content-area">
+      <div class="recent-section" id="recent-section">
+        <div class="section-header">
+          <div class="section-title">
+            <span id="recent-title">Recent Updates</span>
+            <span id="recent-count" class="section-count">0</span>
+          </div>
+        </div>
+        <div class="newsletter-grid" id="recent-content">
+          <div class="no-results">
+            <span class="loading-spinner"></span> Loading tidbits...
+          </div>
+        </div>
+      </div>
+
+      <div class="archive-section" id="archive-section">
+        <div class="section-header">
+          <div class="section-title">
+            <span id="archive-title">Archive</span>
+            <span id="archive-count" class="section-count">0</span>
+          </div>
+        </div>
+        <div class="newsletter-grid" id="archive-content"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal -->
+  <div class="modal-overlay" id="modal" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="m-title">
+      <div class="modal-head">
+        <div class="date-badge" id="m-date"></div>
+        <div class="modal-title" id="m-title"></div>
+        <button class="modal-close" id="m-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-meta" id="m-cats"></div>
+        <div id="m-content" class="content-full"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let newsletterData = [];
+      let filteredRecentData = [];
+      let filteredArchiveData = [];
+      let currentView = "recent";
+      let isLoading = false;
+      let dualView = false;
+      let searchMode = false;
+      let combinedResults = [];
+      let CATEGORY_LIST = [];
+      let lastFetchTime = 0;
+      let fetchCooldown = 30000; // 30 seconds between fetches
+
+      const modal = document.getElementById("modal");
+      const appShell = document.getElementById("appShell");
+
+      document.addEventListener("DOMContentLoaded", () => {
+        document
+          .getElementById("refresh-btn")
+          .addEventListener("click", refreshData);
+        document
+          .getElementById("recent-btn")
+          .addEventListener("click", showRecent);
+        document
+          .getElementById("archive-btn")
+          .addEventListener("click", showArchive);
+        document
+          .getElementById("bu-filter")
+          .addEventListener("change", applyFilters);
+        document
+          .getElementById("search-input")
+          .addEventListener("input", applyFilters);
+
+        document
+          .getElementById("m-close")
+          .addEventListener("click", closeModal);
+        modal.addEventListener("click", (e) => {
+          if (e.target === modal) closeModal();
+        });
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && modal.classList.contains("open"))
+            closeModal();
+        });
+
+        populateCategoryFilter();
+
+        // Try to preload data for faster initial load
+        console.log("Checking cache status...");
+        google.script.run
+          .withSuccessHandler((stats) => {
+            console.log("Cache stats:", stats);
+            if (stats.primaryCache || stats.backupCache) {
+              console.log("Cache available - loading data");
+              fetchDataFromSheet();
+            } else {
+              console.log("No cache - preloading data");
+              google.script.run
+                .withSuccessHandler((result) => {
+                  console.log("Preload result:", result);
+                  fetchDataFromSheet();
+                })
+                .withFailureHandler((error) => {
+                  console.warn("Preload failed:", error);
+                  fetchDataFromSheet();
+                })
+                .preloadData();
+            }
+          })
+          .withFailureHandler((error) => {
+            console.warn("Cache check failed:", error);
+            fetchDataFromSheet();
+          })
+          .getCacheStats();
+      });
+
+      window.showRecent = showRecent;
+      window.showArchive = showArchive;
+
+      window.updateLoadingState = function (loading) {
+        const btn = document.getElementById("refresh-btn");
+        if (btn) btn.disabled = loading;
+      };
+
+      const BLANK_IS_PUBLISHED = true;
+      function isPublishedCell(val) {
+        const s = (val ?? "").toString().trim().toLowerCase();
+        if (!s) return BLANK_IS_PUBLISHED;
+        return (
+          s === "published" ||
+          s === "yes" ||
+          s === "y" ||
+          s === "true" ||
+          s === "1"
+        );
+      }
+
+      function fetchDataFromSheet(force = false) {
+        if (isLoading) return;
+
+        // Prevent excessive server calls unless forced
+        const now = Date.now();
+        if (!force && now - lastFetchTime < fetchCooldown) {
+          console.log("Fetch skipped - cooldown active");
+          return;
+        }
+
+        isLoading = true;
+        lastFetchTime = now;
+        updateLoadingState(true);
+
+        const startTime = performance.now();
+        console.log("Fetching data from server...");
+
+        google.script.run
+          .withSuccessHandler((data) => {
+            const fetchTime = performance.now() - startTime;
+            console.log(`Data fetched in ${fetchTime.toFixed(2)}ms`);
+            onDataSuccess(data);
+          })
+          .withFailureHandler(onDataError)
+          .getSheetData();
+      }
+
+      function onDataSuccess(data) {
+        const processingStart = performance.now();
+        try {
+          if (!Array.isArray(data) || data.length === 0)
+            throw new Error("No data available");
+
+          console.log(`Processing ${data.length} rows from server`);
+
+          const header = data[0].map((h) => (h || "").toString().trim());
+          const rows = data.slice(1).filter((r) => r && r.length);
+
+          const findCol = (needle, fallbackIndex) => {
+            const idx = header.findIndex(
+              (h) => h.toLowerCase() === needle.toLowerCase()
+            );
+            return idx >= 0 ? idx : fallbackIndex;
+          };
+          const findAnyCol = (needles, fallbackIndex) => {
+            for (const n of needles) {
+              const i = header.findIndex(
+                (h) => h.toLowerCase() === n.toLowerCase()
+              );
+              if (i >= 0) return i;
+            }
+            return fallbackIndex;
+          };
+
+          // Map to your actual sheet headers
+          const idx = {
+            dateSubmitted: findAnyCol(["Date submitted", "Date Submitted"], 0),
+            title: findAnyCol(["Weekly Tidbit Information", "Title"], 1),
+            content: findAnyCol(
+              ["Weekly Tidbit Test", "Content", "Weekly Tidbit Description"],
+              2
+            ),
+            contentHTML: findAnyCol(
+              ["ContentHTML", "Content Html", "Content (HTML)"],
+              -1
+            ),
+            metatags: findAnyCol(
+              ["BU/OSO Sector", "Metatags", "Category", "Categories", "Tags"],
+              3
+            ),
+            postBy: findAnyCol(
+              ["Post no later than date", "Post No Later Than Date"],
+              4
+            ),
+            published: findAnyCol(["Published"], -1),
+          };
+          const hasPublished = idx.published >= 0;
+
+          newsletterData = rows
+            .map((r) => {
+              const cats = cleanCategories(r[idx.metatags]);
+              const plain = (r[idx.content] || "").toString();
+              const htmlFromServer =
+                idx.contentHTML >= 0
+                  ? (r[idx.contentHTML] || "").toString()
+                  : "";
+              const safeHtml = htmlFromServer
+                ? sanitizeHtml(htmlFromServer)
+                : linkifyAndSanitize(plain);
+
+              return {
+                dateSubmitted: r[idx.dateSubmitted] || "",
+                title: (r[idx.title] || "").toString().trim(),
+                content: plain,
+                contentHtml: safeHtml, // for modal/full view with links preserved
+                categories: cats.length ? cats : ["Uncategorized"],
+                postNoLaterThan: idx.postBy >= 0 ? r[idx.postBy] || "" : "",
+                published: hasPublished ? r[idx.published] || "" : "Published",
+              };
+            })
+            .filter((x) => x.title || x.content)
+            .filter((x) => !hasPublished || isPublishedCell(x.published));
+
+          CATEGORY_LIST = deriveCategories(newsletterData);
+          populateCategoryFilter();
+
+          isLoading = false;
+          updateLoadingState(false);
+
+          const processingTime = performance.now() - processingStart;
+          console.log(
+            `Client processing completed in ${processingTime.toFixed(2)}ms`
+          );
+
+          applyFilters();
+        } catch (err) {
+          onDataError(err);
+        }
+      }
+
+      function onDataError(error) {
+        console.error("Error fetching data:", error);
+        isLoading = false;
+        updateLoadingState(false);
+        const recentContent = document.getElementById("recent-content");
+        recentContent.innerHTML =
+          '<div class="error-message">Failed to load data from Google Sheets.<br/>' +
+          (error && error.toString
+            ? escapeHTML(error.toString())
+            : "Unknown error") +
+          '<br/><button class="refresh-btn" onclick="google.script.host.close()">Close</button></div>';
+      }
+
+      // ----- Categories strictly from Column D (BU/OSO Sector) -----
+      function parseMetatags(val) {
+        const s = (val ?? "").toString();
+        return s
+          .split(/[,;|]/g)
+          .map((t) => t.trim())
+          .filter(Boolean);
+      }
+      function cleanCategories(val) {
+        const toks = parseMetatags(val);
+        return toks.filter((t) => {
+          if (!t) return false;
+          if (t.toLowerCase().includes("http")) return false;
+          if (/[<>]/.test(t)) return false;
+          return t.length <= 64;
+        });
+      }
+      function deriveCategories(rows) {
+        const seen = new Map();
+        for (const r of rows)
+          for (const c of r.categories || []) {
+            const k = c.toLowerCase();
+            if (!seen.has(k)) seen.set(k, c);
+          }
+        return seen.size
+          ? [...seen.values()].sort((a, b) =>
+              a.localeCompare(b, undefined, { sensitivity: "base" })
+            )
+          : ["Uncategorized"];
+      }
+      function populateCategoryFilter() {
+        const el = document.getElementById("bu-filter");
+        const current = el.value;
+        el.innerHTML = '<option value="">All</option>';
+        (CATEGORY_LIST || []).forEach((cat) => {
+          const opt = document.createElement("option");
+          opt.value = cat;
+          opt.textContent = cat;
+          el.appendChild(opt);
+        });
+        if (current && CATEGORY_LIST.includes(current)) el.value = current;
+      }
+
+      // ----- Filter / View -----
+      function applyFilters() {
+        const selectedCat = document.getElementById("bu-filter").value.trim();
+        const q = document
+          .getElementById("search-input")
+          .value.toLowerCase()
+          .trim();
+
+        dualView = !!selectedCat || !!q.length;
+
+        const filteredAll = newsletterData.filter((it) => {
+          if (selectedCat) {
+            const sel = selectedCat.toLowerCase();
+            if (!(it.categories || []).some((c) => c.toLowerCase() === sel))
+              return false;
+          }
+          if (q) {
+            const bank = `${it.title} ${it.content} ${(
+              it.categories || []
+            ).join(" ")}`.toLowerCase();
+            if (!bank.includes(q)) return false;
+          }
+          return true;
+        });
+
+        searchMode = q.length > 0;
+        combinedResults = filteredAll.slice();
+
+        const recentCheck = (it) => isWithin7Days(it.dateSubmitted);
+        filteredRecentData = filteredAll.filter(recentCheck);
+        filteredArchiveData = filteredAll.filter((x) => !recentCheck(x));
+
+        const byNewest = (a, b) => {
+          const da = new Date(a.dateSubmitted || a.postNoLaterThan || 0);
+          const db = new Date(b.dateSubmitted || b.postNoLaterThan || 0);
+          return db - da;
+        };
+        if (searchMode || dualView) {
+          filteredRecentData.sort(byNewest);
+          filteredArchiveData.sort(byNewest);
+        } else {
+          filteredRecentData.sort((a, b) => {
+            const da = new Date(a.postNoLaterThan || a.dateSubmitted || 0);
+            const db = new Date(b.postNoLaterThan || b.dateSubmitted || 0);
+            return da - db;
+          });
+          filteredArchiveData.sort(byNewest);
+        }
+
+        setViewFromFilters();
+        setSectionTitles(q);
+        renderLists();
+        updateCounts();
+      }
+
+      function isWithin7Days(dateString) {
+        if (!dateString) return false;
+        try {
+          const today = new Date();
+          const d = new Date(dateString);
+          const days = Math.ceil(Math.abs(today - d) / 86400000);
+          return days <= 7;
+        } catch {
+          return false;
+        }
+      }
+
+      function setViewFromFilters() {
+        const recentSection = document.getElementById("recent-section");
+        const archiveSection = document.getElementById("archive-section");
+        const recentBtn = document.getElementById("recent-btn");
+        const archiveBtn = document.getElementById("archive-btn");
+
+        if (dualView) {
+          recentSection.classList.remove("hidden");
+          archiveSection.classList.add("active");
+          recentBtn.classList.remove("active");
+          archiveBtn.classList.remove("active");
+          recentBtn.setAttribute("disabled", "true");
+          archiveBtn.setAttribute("disabled", "true");
+        } else {
+          recentBtn.removeAttribute("disabled");
+          archiveBtn.removeAttribute("disabled");
+          if (currentView === "recent") {
+            recentSection.classList.remove("hidden");
+            archiveSection.classList.remove("active");
+            recentBtn.classList.add("active");
+            archiveBtn.classList.remove("active");
+          } else {
+            recentSection.classList.add("hidden");
+            archiveSection.classList.add("active");
+            recentBtn.classList.remove("active");
+            archiveBtn.classList.add("active");
+          }
+        }
+      }
+
+      function renderLists() {
+        if (dualView) {
+          displayRecentNewsletters();
+          displayArchiveNewsletters();
+        } else {
+          if (currentView === "recent") displayRecentNewsletters();
+          else displayArchiveNewsletters();
+        }
+      }
+
+      function setSectionTitles(q) {
+        const recentTitleEl = document.getElementById("recent-title");
+        const archiveTitleEl = document.getElementById("archive-title");
+        if (dualView) {
+          const suffix = q ? " (Filtered)" : "";
+          if (recentTitleEl)
+            recentTitleEl.textContent = "Recent Updates" + suffix;
+          if (archiveTitleEl) archiveTitleEl.textContent = "Archive" + suffix;
+        } else {
+          if (searchMode) {
+            if (recentTitleEl) recentTitleEl.textContent = "Search Results";
+          } else {
+            if (recentTitleEl) recentTitleEl.textContent = "Recent Updates";
+            if (archiveTitleEl) archiveTitleEl.textContent = "Archive";
+          }
+        }
+      }
+
+      // ----- Rendering -----
+      function displayRecentNewsletters() {
+        const container = document.getElementById("recent-content");
+        if (!filteredRecentData.length) {
+          container.innerHTML = emptyState(
+            "No recent tidbits found",
+            "Try adjusting your filters or check the archive"
+          );
+          return;
+        }
+        container.innerHTML = "";
+        filteredRecentData.forEach((item) =>
+          container.appendChild(createNewsletterCard(item))
+        );
+      }
+
+      // Archive state management
+      let archiveState = {
+        expandedMonths: new Set(),
+        initialized: false,
+      };
+
+      function displayArchiveNewsletters() {
+        const container = document.getElementById("archive-content");
+
+        if (!filteredArchiveData.length) {
+          container.innerHTML = emptyState(
+            "No archived tidbits found",
+            "Archives contain tidbits older than 7 days"
+          );
+          return;
+        }
+
+        const groups = groupByMonth(filteredArchiveData);
+
+        // Clear container and reset state only if not initialized
+        if (!archiveState.initialized) {
+          container.innerHTML = "";
+          archiveState.expandedMonths.clear();
+          archiveState.initialized = true;
+        } else {
+          // Preserve existing state, just update content
+          container.innerHTML = "";
+        }
+
+        groups.forEach((g, index) => {
+          const monthContainer = createModernMonthContainer(g, index);
+          container.appendChild(monthContainer);
+        });
+      }
+
+      function createModernMonthContainer(group, index) {
+        const isExpanded = archiveState.expandedMonths.has(group.key);
+
+        // Main container with modern styling
+        const container = document.createElement("div");
+        container.className = `
+          mb-6 bg-white rounded-2xl shadow-lg border border-gray-100 
+          hover:shadow-xl transition-all duration-300 overflow-hidden
+        `.trim();
+        container.setAttribute("data-month-container", group.key);
+
+        // Header with gradient and modern styling
+        const header = document.createElement("div");
+        header.className = `
+          relative bg-gradient-to-r from-blue-50 to-indigo-50 
+          border-b border-gray-100 cursor-pointer group
+          hover:from-blue-100 hover:to-indigo-100 transition-all duration-200
+        `.trim();
+
+        const headerContent = document.createElement("div");
+        headerContent.className = "flex items-center justify-between p-6";
+
+        // Left side - Title and count
+        const leftSide = document.createElement("div");
+        leftSide.className = "flex items-center gap-4";
+
+        const monthTitle = document.createElement("h3");
+        monthTitle.className = `
+          text-xl font-bold text-gray-800 group-hover:text-blue-700 
+          transition-colors duration-200
+        `.trim();
+        monthTitle.textContent = group.label;
+
+        const monthCount = document.createElement("span");
+        monthCount.className = `
+          bg-blue-600 text-white text-sm font-semibold px-3 py-1.5 
+          rounded-full shadow-sm group-hover:bg-blue-700 transition-colors duration-200
+        `.trim();
+        monthCount.textContent = group.items.length;
+
+        leftSide.appendChild(monthTitle);
+        leftSide.appendChild(monthCount);
+
+        // Right side - Arrow indicator
+        const arrow = document.createElement("div");
+        arrow.className = `
+          w-8 h-8 flex items-center justify-center rounded-full 
+          bg-white shadow-sm group-hover:shadow-md transition-all duration-200
+          ${isExpanded ? "rotate-90" : ""}
+        `.trim();
+        arrow.innerHTML = `
+          <svg class="w-4 h-4 text-gray-600 group-hover:text-blue-600 transition-colors duration-200" 
+               fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+          </svg>
+        `;
+        arrow.setAttribute("data-arrow", group.key);
+
+        headerContent.appendChild(leftSide);
+        headerContent.appendChild(arrow);
+        header.appendChild(headerContent);
+
+        // Content container with smooth animation
+        const content = document.createElement("div");
+        content.className = `
+          overflow-hidden transition-all duration-300 ease-in-out
+          ${isExpanded ? "max-h-none opacity-100" : "max-h-0 opacity-0"}
+        `.trim();
+        content.setAttribute("data-content", group.key);
+
+        const contentInner = document.createElement("div");
+        contentInner.className = "p-6 bg-gray-50";
+
+        // Modern grid with better spacing
+        const grid = document.createElement("div");
+        grid.className = `
+          grid gap-6 
+          grid-cols-1 
+          md:grid-cols-2 
+          xl:grid-cols-3
+        `.trim();
+
+        group.items.forEach((item) => {
+          const card = createModernNewsletterCard(item);
+          grid.appendChild(card);
+        });
+
+        contentInner.appendChild(grid);
+        content.appendChild(contentInner);
+
+        // Add click handler with proper event management
+        header.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          toggleModernMonth(group.key);
+        });
+
+        container.appendChild(header);
+        container.appendChild(content);
+
+        return container;
+      }
+
+      function createModernNewsletterCard(item) {
+        const card = document.createElement("div");
+        card.className = `
+          bg-white rounded-xl p-6 shadow-sm border border-gray-200
+          hover:shadow-lg hover:border-blue-200 hover:-translate-y-1
+          transition-all duration-200 cursor-pointer group relative
+        `.trim();
+
+        const dateStr = formatDate(resolveDate(item.dateSubmitted));
+        const excerptText = truncate(stripHtml(item.contentHtml), 280);
+
+        // Date badge
+        const dateBadge = document.createElement("div");
+        dateBadge.className = `
+          absolute top-4 right-4 bg-gray-100 text-gray-600 text-xs 
+          font-medium px-2 py-1 rounded-lg border
+        `.trim();
+        dateBadge.textContent = dateStr || "";
+
+        // Title
+        const title = document.createElement("h4");
+        title.className = `
+          text-lg font-bold text-gray-800 mb-4 pr-16 leading-tight
+          group-hover:text-blue-700 transition-colors duration-200
+        `.trim();
+        title.textContent = item.title || "(Untitled)";
+
+        // Categories
+        const categoriesContainer = document.createElement("div");
+        categoriesContainer.className =
+          "flex flex-wrap gap-2 mb-4 pb-4 border-b border-gray-100";
+
+        (item.categories || []).forEach((category) => {
+          const chip = document.createElement("span");
+          chip.className = `
+            inline-block bg-gradient-to-r from-blue-500 to-blue-600 
+            text-white text-xs font-medium px-3 py-1 rounded-full
+            shadow-sm hover:shadow-md transition-shadow duration-200
+          `.trim();
+          chip.textContent = category;
+          categoriesContainer.appendChild(chip);
+        });
+
+        // Content preview
+        const contentPreview = document.createElement("p");
+        contentPreview.className = "text-gray-600 leading-relaxed text-sm";
+        contentPreview.textContent = excerptText;
+
+        card.appendChild(dateBadge);
+        card.appendChild(title);
+        card.appendChild(categoriesContainer);
+        card.appendChild(contentPreview);
+
+        card.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openModal(item, dateStr);
+        });
+
+        return card;
+      }
+
+      function toggleModernMonth(monthKey) {
+        const content = document.querySelector(`[data-content="${monthKey}"]`);
+        const arrow = document.querySelector(`[data-arrow="${monthKey}"]`);
+
+        if (!content || !arrow) return;
+
+        const isExpanded = archiveState.expandedMonths.has(monthKey);
+
+        if (isExpanded) {
+          // Collapse
+          archiveState.expandedMonths.delete(monthKey);
+          content.classList.remove("max-h-none", "opacity-100");
+          content.classList.add("max-h-0", "opacity-0");
+          arrow.classList.remove("rotate-90");
+        } else {
+          // Expand
+          archiveState.expandedMonths.add(monthKey);
+          content.classList.remove("max-h-0", "opacity-0");
+          content.classList.add("max-h-none", "opacity-100");
+          arrow.classList.add("rotate-90");
+        }
+      }
+
+      function emptyState(title, hint) {
+        return (
+          '<div class="no-results">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor">' +
+          '<circle cx="11" cy="11" r="8"></circle>' +
+          '<path d="m21 21-4.35-4.35"></path>' +
+          "</svg>" +
+          "<div>" +
+          escapeHTML(title) +
+          "</div>" +
+          "<small>" +
+          escapeHTML(hint || "") +
+          "</small>" +
+          "</div>"
+        );
+      }
+
+      function createNewsletterCard(item) {
+        const card = document.createElement("div");
+        card.className = "newsletter-card fade-in relative w-full";
+        const dateStr = formatDate(resolveDate(item.dateSubmitted));
+        const excerptText = truncate(stripHtml(item.contentHtml), 280);
+
+        const chips = (item.categories || [])
+          .map(
+            (c) =>
+              '<span class="inline-block bg-gradient-to-r from-blue-600 to-blue-700 text-white text-xs font-semibold px-3 py-1 rounded-full mr-2 mb-2">' +
+              escapeHTML(c) +
+              "</span>"
+          )
+          .join("");
+
+        card.innerHTML = `
+          <div class="absolute top-2 right-2 bg-gray-100 text-gray-700 text-xs font-bold px-2 py-1 rounded-full border" title="Date Submitted">
+            ${dateStr || ""}
+          </div>
+          <div class="pr-20 mb-4">
+            <div class="text-lg font-bold text-gray-800 leading-tight">
+              ${escapeHTML(item.title || "(Untitled)")}
+            </div>
+          </div>
+          <div class="mb-4 pt-3 border-t border-gray-200">
+            ${chips}
+          </div>
+          <div class="text-gray-600 leading-relaxed">
+            ${escapeHTML(excerptText)}
+          </div>
+        `;
+
+        card.addEventListener("click", () => openModal(item, dateStr));
+        return card;
+      }
+
+      // ----- Modal (keeps links) -----
+      function openModal(item, dateStr) {
+        document.getElementById("m-title").textContent =
+          item.title || "(Untitled)";
+        document.getElementById("m-date").textContent = dateStr || "";
+        document.getElementById("m-cats").innerHTML = (item.categories || [])
+          .map((c) => '<span class="modal-cat">' + escapeHTML(c) + "</span>")
+          .join("");
+
+        const reClose = new RegExp("<" + "\\/" + "script\\s*>", "gi");
+        const reOpen = new RegExp("<" + "script\\b", "gi");
+        const reCloseStyle = new RegExp("<" + "\\/" + "style\\s*>", "gi");
+        const reOpenStyle = new RegExp("<" + "style\\b", "gi");
+
+        const html = item.contentHtml || linkifyAndSanitize(item.content);
+        const hardened = html
+          .replace(reClose, "<\\/script>")
+          .replace(reOpen, "<scri" + "pt")
+          .replace(reCloseStyle, "<\\/style>")
+          .replace(reOpenStyle, "<sty" + "le>");
+
+        document.getElementById("m-content").innerHTML = hardened;
+
+        modal.classList.add("open");
+        appShell.classList.add("blur");
+        document.body.style.overflow = "hidden";
+        document.getElementById("m-close").focus();
+      }
+      function closeModal() {
+        modal.classList.remove("open");
+        appShell.classList.remove("blur");
+        document.body.style.overflow = "";
+      }
+
+      // ----- HTML helpers -----
+      function escapeHTML(str) {
+        return (str || "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function linkifyAndSanitize(plain) {
+        let s = escapeHTML(plain || "");
+        s = s.replace(
+          /((?:https?:\/\/|ftp:\/\/)[^\s<)]+[^\s<\.,)])/gi,
+          (m) =>
+            '<a href="' +
+            m +
+            '" target="_blank" rel="noopener noreferrer">' +
+            m +
+            "</a>"
+        );
+        s = s.replace(
+          /(^|[\s>])((?:www\.)[^\s<)]+[^\s<\.,)])/gi,
+          (match, p1, p2) => {
+            const url = "https://" + p2;
+            return (
+              p1 +
+              '<a href="' +
+              url +
+              '" target="_blank" rel="noopener noreferrer">' +
+              p2 +
+              "</a>"
+            );
+          }
+        );
+        s = s.replace(
+          /([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi,
+          (m) => '<a href="mailto:' + m + '">' + m + "</a>"
+        );
+        s = s.replace(/\n/g, "<br>");
+        return sanitizeHtml(s);
+      }
+
+      function sanitizeHtml(html) {
+        const allowed = new Set([
+          "A",
+          "BR",
+          "P",
+          "UL",
+          "OL",
+          "LI",
+          "STRONG",
+          "EM",
+          "B",
+          "I",
+          "U",
+          "SPAN",
+        ]);
+        const temp = document.createElement("div");
+        temp.innerHTML = html || "";
+
+        const walker = document.createTreeWalker(
+          temp,
+          NodeFilter.SHOW_ELEMENT,
+          null
+        );
+        const toRemove = [];
+        while (walker.nextNode()) {
+          const el = walker.currentNode;
+          if (!allowed.has(el.tagName)) {
+            toRemove.push(el);
+            continue;
+          }
+          if (el.tagName === "A") {
+            const href = (el.getAttribute("href") || "").trim();
+            const safe = href && /^(https?:\/\/|mailto:)/i.test(href);
+            if (!safe) {
+              const span = document.createElement("span");
+              span.textContent = el.textContent || "";
+              el.replaceWith(span);
+              continue;
+            }
+            el.setAttribute("target", "_blank");
+            el.setAttribute("rel", "noopener noreferrer");
+            [...el.attributes].forEach((a) => {
+              if (!["href", "target", "rel", "style"].includes(a.name))
+                el.removeAttribute(a.name);
+            });
+          } else if (el.tagName === "SPAN") {
+            const style = el.getAttribute("style") || "";
+            const safeStyle = style
+              .split(";")
+              .map((s) => s.trim())
+              .filter(
+                (s) => /^color\s*:/i.test(s) || /^text-decoration\s*:/i.test(s)
+              )
+              .join(";");
+            if (safeStyle) el.setAttribute("style", safeStyle);
+            else el.removeAttribute("style");
+            [...el.attributes].forEach((a) => {
+              if (!["style"].includes(a.name)) el.removeAttribute(a.name);
+            });
+          } else {
+            [...el.attributes].forEach((a) => el.removeAttribute(a.name));
+          }
+        }
+        for (const el of toRemove)
+          el.replaceWith(document.createTextNode(el.textContent || ""));
+
+        const reClose = new RegExp("<" + "\\/" + "script\\s*>", "gi");
+        const reOpen = new RegExp("<" + "script\\b", "gi");
+        const reCloseStyle = new RegExp("<" + "\\/" + "style\\s*>", "gi");
+        const reOpenStyle = new RegExp("<" + "style\\b", "gi");
+        return temp.innerHTML
+          .replace(reClose, "<\\/script>")
+          .replace(reOpen, "<scri" + "pt>")
+          .replace(reCloseStyle, "<\\/style>")
+          .replace(reOpenStyle, "<sty" + "le>");
+      }
+
+      function stripHtml(html) {
+        const div = document.createElement("div");
+        div.innerHTML = html || "";
+        return (div.textContent || div.innerText || "").trim();
+      }
+      function truncate(s, n) {
+        return !s ? "" : s.length > n ? s.slice(0, n - 1) + "…" : s;
+      }
+
+      function resolveDate(val) {
+        if (!val && val !== 0) return null;
+        if (Object.prototype.toString.call(val) === "[object Date]")
+          return isNaN(val.getTime()) ? null : val;
+        if (typeof val === "number") {
+          const ms = Math.round((val - 25569) * 86400 * 1000);
+          const d = new Date(ms);
+          return isNaN(d.getTime()) ? null : d;
+        }
+        if (typeof val === "string") {
+          const d = new Date(val);
+          return isNaN(d.getTime()) ? null : d;
+        }
+        return null;
+      }
+      function formatDate(d) {
+        if (!d) return "";
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        const yyyy = d.getFullYear();
+        return mm + "/" + dd + "/" + yyyy;
+      }
+
+      function showRecent() {
+        if (dualView) return;
+        currentView = "recent";
+        setViewFromFilters();
+        renderLists();
+        updateCounts();
+      }
+      function showArchive() {
+        if (dualView) return;
+        currentView = "archive";
+        setViewFromFilters();
+        renderLists();
+        updateCounts();
+      }
+
+      function updateCounts() {
+        const rc = filteredRecentData.length;
+        const ac = filteredArchiveData.length;
+        document.getElementById("recent-count").textContent = rc;
+        document.getElementById("archive-count").textContent = ac;
+        document.getElementById("recent-badge").textContent = rc
+          ? "(" + rc + ")"
+          : "";
+        document.getElementById("archive-badge").textContent = ac
+          ? "(" + ac + ")"
+          : "";
+      }
+
+      function refreshData() {
+        console.log("Manual refresh requested");
+        fetchDataFromSheet(true); // Force refresh
+      }
+
+      // --- Month helpers ---
+      function monthKey(d) {
+        if (!d) return "0000-00";
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, "0");
+        return y + "-" + m; // e.g. 2025-09
+      }
+
+      function monthLabel(d) {
+        if (!d) return "Unknown Month";
+        // uses browser locale; adjust if you want a fixed locale.
+        return d.toLocaleString(undefined, { month: "long", year: "numeric" });
+      }
+
+      function groupByMonth(items) {
+        const map = new Map();
+        for (const it of items) {
+          const d =
+            resolveDate(it.dateSubmitted) || resolveDate(it.postNoLaterThan);
+          const key = monthKey(d);
+          const label = monthLabel(d);
+
+          if (!map.has(key)) map.set(key, { key, label, items: [] });
+          map.get(key).items.push(it);
+        }
+
+        // sort each month's items newest → oldest
+        for (const g of map.values()) {
+          g.items.sort((a, b) => {
+            const da = new Date(a.dateSubmitted || a.postNoLaterThan || 0);
+            const db = new Date(b.dateSubmitted || b.postNoLaterThan || 0);
+            return db - da;
+          });
+        }
+
+        // return groups sorted by month descending (newest month first)
+        return Array.from(map.values()).sort((a, b) =>
+          b.key.localeCompare(a.key)
+        );
+      }
+  </script>
+</body>
+
+</html>
