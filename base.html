@@ -644,14 +644,55 @@
     width: 100%;
   }
 
-  /* Smooth transitions for archive content */
+  /* Improved smooth transitions for archive content */
   [data-content] {
-    transition: max-height 0.3s ease-in-out, opacity 0.3s ease-in-out;
+    transition: max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0.3s ease-in-out,
+                padding 0.3s ease-in-out;
+    will-change: max-height, opacity;
   }
 
-  /* Ensure proper containment */
+  [data-content].expanding {
+    max-height: 10000px !important; /* Large enough for any content */
+    opacity: 1 !important;
+  }
+
+  [data-content].collapsing {
+    max-height: 0 !important;
+    opacity: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+  }
+
+  /* Ensure proper containment and spacing */
   [data-month-container] {
     contain: layout style;
+    margin-bottom: 1.5rem;
+  }
+
+  /* Prevent content from overflowing */
+  [data-month-container] .contentInner {
+    padding: 1.5rem;
+    background: linear-gradient(to bottom, #f9fafb, #ffffff);
+  }
+
+  /* Better spacing for archive grid */
+  .archive-month-grid {
+    display: grid;
+    gap: 1.5rem;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    width: 100%;
+  }
+
+  /* Archive header improvements */
+  .archive-month-header {
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .archive-month-header:active {
+    transform: scale(0.99);
   }
 
   /* Modern card hover effects */
@@ -662,6 +703,69 @@
 
   .modern-card:hover {
     transform: translateY(-2px);
+  }
+
+  /* Text truncation utilities (if Tailwind line-clamp not available) */
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .line-clamp-4 {
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Prevent layout shift during archive animations */
+  .archive-section .newsletter-grid {
+    min-height: 200px;
+  }
+
+  /* Smooth scroll behavior */
+  [data-month-container] {
+    scroll-margin-top: 20px;
+  }
+
+  /* Better focus states for accessibility */
+  .archive-month-header:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+  }
+
+  /* Improved arrow rotation */
+  [data-arrow] {
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  [data-arrow].rotate-90 {
+    transform: rotate(90deg);
+  }
+
+  /* Responsive adjustments for archive */
+  @media (max-width: 768px) {
+    [data-month-container] {
+      margin-bottom: 1rem;
+    }
+
+    [data-month-container] .contentInner {
+      padding: 1rem;
+    }
+
+    .archive-month-grid {
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+
+    /* Reduce padding on mobile */
+    .archive-month-header .flex {
+      padding: 1rem !important;
+    }
   }
 
   /* Legacy month group styles - kept for compatibility */
