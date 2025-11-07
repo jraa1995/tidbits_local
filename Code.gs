@@ -19,10 +19,10 @@
 const WEBAPP_TITLE = "Weekly Tidbits";
 const SHEET_NAME = "Weekly Tidbits"; // change if your tab name differs
 const HEADER_ROW = 1;
-const CACHE_KEY = "tidbitsData_v6"; // bump to invalidate old cache
-const CACHE_TTL_SEC = 300; // 5 minutes cache
-const CACHE_BACKUP_KEY = "tidbitsData_backup_v6"; // longer backup cache
-const CACHE_BACKUP_TTL_SEC = 1800; // 30 minutes backup
+const CACHE_KEY = "tidbitsData_v7"; // bump to invalidate old cache (optimized)
+const CACHE_TTL_SEC = 600; // 10 minutes cache (increased for better performance)
+const CACHE_BACKUP_KEY = "tidbitsData_backup_v7"; // longer backup cache
+const CACHE_BACKUP_TTL_SEC = 3600; // 60 minutes backup (increased)
 
 /** Optional: server-side allowlist for categories (not enforced here) */
 const ALLOWED_CATEGORIES = [
@@ -173,47 +173,36 @@ function getSheetData() {
 
   // Process rows with optimized rich text handling
   const outRows = [];
-  const batchSize = 25; // Process in smaller batches for better performance
 
-  for (
-    let batchStart = 1;
-    batchStart < display.length;
-    batchStart += batchSize
-  ) {
-    const batchEnd = Math.min(batchStart + batchSize, display.length);
+  // Process all rows at once - no artificial batching delays
+  for (let r = 1; r < display.length; r++) {
+    const dispRow = display[r] || [];
+    const richRow = rich[r] || [];
+    const rt = richRow[idx.content] || null;
+    const dispText = (dispRow[idx.content] || "").toString();
 
-    for (let r = batchStart; r < batchEnd; r++) {
-      const dispRow = display[r] || [];
-      const richRow = rich[r] || [];
-      const rt = richRow[idx.content] || null;
-      const dispText = (dispRow[idx.content] || "").toString();
+    // Only process rich text if there's actual content
+    const html = dispText.trim() ? richTextToHtml_(rt, dispText) : "";
+    const newRow = dispRow.slice();
 
-      // Only process rich text if there's actual content
-      const html = dispText.trim() ? richTextToHtml_(rt, dispText) : "";
-      const newRow = dispRow.slice();
+    while (newRow.length < outHeader.length - 1) newRow.push("");
+    newRow.push(html);
 
-      while (newRow.length < outHeader.length - 1) newRow.push("");
-      newRow.push(html);
-
-      outRows.push(newRow);
-    }
-
-    // Allow other processes to run between batches
-    if (batchStart % 100 === 0) {
-      Utilities.sleep(1);
-    }
+    outRows.push(newRow);
   }
 
   const result = [outHeader].concat(outRows);
+  const processingTime = new Date().getTime() - startTime;
   const resultJson = JSON.stringify(result);
+  const dataSize = Math.round(resultJson.length / 1024); // Size in KB
 
   // Store in both primary and backup caches
   try {
     cache.put(CACHE_KEY, resultJson, CACHE_TTL_SEC);
     cache.put(CACHE_BACKUP_KEY, resultJson, CACHE_BACKUP_TTL_SEC);
     console.log(
-      `Processed and cached ${result.length} rows in ${new Date().getTime() - startTime
-      }ms`
+      `✓ Processed ${result.length} rows (${dataSize}KB) in ${processingTime}ms | ` +
+      `Cached with TTL: primary=${CACHE_TTL_SEC}s, backup=${CACHE_BACKUP_TTL_SEC}s`
     );
   } catch (e) {
     console.warn("Failed to cache result:", e);
@@ -233,6 +222,8 @@ function getSheetData() {
  * - Keeps foreground color via <span style="color:#RRGGBB">
  * - Preserves newlines as <br>
  * Falls back to linkifying plain text if RichText is absent.
+ *
+ * OPTIMIZED: Uses getRuns() API when available for better performance
  */
 function richTextToHtml_(rtValue, fallbackText) {
   try {
@@ -240,50 +231,86 @@ function richTextToHtml_(rtValue, fallbackText) {
       const text = rtValue.getText() || "";
       if (!text) return "";
 
+      // Try to use getRuns() API for better performance (available in newer Apps Script)
+      let runs = [];
+      try {
+        if (typeof rtValue.getRuns === "function") {
+          runs = rtValue.getRuns();
+        }
+      } catch (e) {
+        // getRuns() not available, fall back to character-by-character
+      }
+
       let html = "";
-      let i = 0;
-      while (i < text.length) {
-        const runUrl = safeStr_(rtValue.getLinkUrl(i, i + 1));
-        const runStyle = rtValue.getTextStyle(i, i + 1);
-        let j = i + 1;
-        while (j < text.length) {
-          const nextUrl = safeStr_(rtValue.getLinkUrl(j, j + 1));
-          const nextStyle = rtValue.getTextStyle(j, j + 1);
-          if (!sameUrl_(runUrl, nextUrl) || !sameStyle_(runStyle, nextStyle))
-            break;
-          j++;
-        }
 
-        let seg = escapeHtml_(text.substring(i, j));
-        // Apply inline formatting (order: link wraps inside the style wrappers or vice versa — either is fine)
-        if (runUrl) {
-          seg =
-            '<a href="' +
-            escapeHtmlAttr_(runUrl) +
-            '" target="_blank" rel="noopener noreferrer">' +
-            seg +
-            "</a>";
-        }
-        if (runStyle) {
-          if (runStyle.isUnderline && runStyle.isUnderline())
-            seg = "<u>" + seg + "</u>";
-          if (runStyle.isItalic && runStyle.isItalic())
-            seg = "<em>" + seg + "</em>";
-          if (runStyle.isBold && runStyle.isBold())
-            seg = "<strong>" + seg + "</strong>";
-          const fg =
-            runStyle.getForegroundColor && runStyle.getForegroundColor();
-          if (fg)
-            seg =
-              '<span style="color:' +
-              escapeCssColor_(fg) +
-              ';">' +
-              seg +
-              "</span>";
-        }
+      if (runs.length > 0) {
+        // FAST PATH: Use runs API
+        for (let runIdx = 0; runIdx < runs.length; runIdx++) {
+          const run = runs[runIdx];
+          const runText = run.getText() || "";
+          if (!runText) continue;
 
-        html += seg;
-        i = j;
+          let seg = escapeHtml_(runText);
+          const runStyle = run.getTextStyle();
+          const runUrl = safeStr_(run.getLinkUrl());
+
+          // Apply inline formatting
+          if (runUrl) {
+            seg = '<a href="' + escapeHtmlAttr_(runUrl) +
+                  '" target="_blank" rel="noopener noreferrer">' + seg + "</a>";
+          }
+          if (runStyle) {
+            if (runStyle.isUnderline && runStyle.isUnderline())
+              seg = "<u>" + seg + "</u>";
+            if (runStyle.isItalic && runStyle.isItalic())
+              seg = "<em>" + seg + "</em>";
+            if (runStyle.isBold && runStyle.isBold())
+              seg = "<strong>" + seg + "</strong>";
+            const fg = runStyle.getForegroundColor && runStyle.getForegroundColor();
+            if (fg)
+              seg = '<span style="color:' + escapeCssColor_(fg) + ';">' + seg + "</span>";
+          }
+          html += seg;
+        }
+      } else {
+        // SLOW PATH: Character-by-character with optimized caching
+        let i = 0;
+        while (i < text.length) {
+          // Sample at current position
+          const runUrl = safeStr_(rtValue.getLinkUrl(i, i + 1));
+          const runStyle = rtValue.getTextStyle(i, i + 1);
+
+          // Find end of this run by binary search or incremental scan
+          let j = i + 1;
+          const maxScan = Math.min(i + 100, text.length); // Limit lookahead
+          while (j < maxScan) {
+            const nextUrl = safeStr_(rtValue.getLinkUrl(j, j + 1));
+            const nextStyle = rtValue.getTextStyle(j, j + 1);
+            if (!sameUrl_(runUrl, nextUrl) || !sameStyle_(runStyle, nextStyle))
+              break;
+            j++;
+          }
+
+          let seg = escapeHtml_(text.substring(i, j));
+          if (runUrl) {
+            seg = '<a href="' + escapeHtmlAttr_(runUrl) +
+                  '" target="_blank" rel="noopener noreferrer">' + seg + "</a>";
+          }
+          if (runStyle) {
+            if (runStyle.isUnderline && runStyle.isUnderline())
+              seg = "<u>" + seg + "</u>";
+            if (runStyle.isItalic && runStyle.isItalic())
+              seg = "<em>" + seg + "</em>";
+            if (runStyle.isBold && runStyle.isBold())
+              seg = "<strong>" + seg + "</strong>";
+            const fg = runStyle.getForegroundColor && runStyle.getForegroundColor();
+            if (fg)
+              seg = '<span style="color:' + escapeCssColor_(fg) + ';">' + seg + "</span>";
+          }
+
+          html += seg;
+          i = j;
+        }
       }
 
       // Preserve line breaks
@@ -291,6 +318,7 @@ function richTextToHtml_(rtValue, fallbackText) {
       return html;
     }
   } catch (e) {
+    console.warn("Rich text conversion error:", e);
     // Fall through to linkify fallback on any API quirk
   }
   // Fallback: plain-text linkify (http(s), www., email)
