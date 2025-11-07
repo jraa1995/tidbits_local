@@ -95,7 +95,7 @@
       let combinedResults = [];
       let CATEGORY_LIST = [];
       let lastFetchTime = 0;
-      let fetchCooldown = 30000; // 30 seconds between fetches
+      let fetchCooldown = 10000; // 10 seconds between fetches (optimized)
 
       const modal = document.getElementById("modal");
       const appShell = document.getElementById("appShell");
@@ -130,33 +130,10 @@
 
         populateCategoryFilter();
 
-        // Try to preload data for faster initial load
-        console.log("Checking cache status...");
-        google.script.run
-          .withSuccessHandler((stats) => {
-            console.log("Cache stats:", stats);
-            if (stats.primaryCache || stats.backupCache) {
-              console.log("Cache available - loading data");
-              fetchDataFromSheet();
-            } else {
-              console.log("No cache - preloading data");
-              google.script.run
-                .withSuccessHandler((result) => {
-                  console.log("Preload result:", result);
-                  fetchDataFromSheet();
-                })
-                .withFailureHandler((error) => {
-                  console.warn("Preload failed:", error);
-                  fetchDataFromSheet();
-                })
-                .preloadData();
-            }
-          })
-          .withFailureHandler((error) => {
-            console.warn("Cache check failed:", error);
-            fetchDataFromSheet();
-          })
-          .getCacheStats();
+        // Optimized: Load data immediately - server handles caching internally
+        window.initialLoadStart = performance.now();
+        console.log("⏳ Loading data...");
+        fetchDataFromSheet();
       });
 
       window.showRecent = showRecent;
@@ -209,11 +186,12 @@
 
       function onDataSuccess(data) {
         const processingStart = performance.now();
+        const totalTime = processingStart - (window.initialLoadStart || processingStart);
         try {
           if (!Array.isArray(data) || data.length === 0)
             throw new Error("No data available");
 
-          console.log(`Processing ${data.length} rows from server`);
+          console.log(`✓ Received ${data.length} rows from server (total: ${totalTime.toFixed(0)}ms)`);
 
           const header = data[0].map((h) => (h || "").toString().trim());
           const rows = data.slice(1).filter((r) => r && r.length);
@@ -290,8 +268,9 @@
           updateLoadingState(false);
 
           const processingTime = performance.now() - processingStart;
+          const totalTimeComplete = performance.now() - (window.initialLoadStart || processingStart);
           console.log(
-            `Client processing completed in ${processingTime.toFixed(2)}ms`
+            `✓ Client processing: ${processingTime.toFixed(0)}ms | Total time: ${totalTimeComplete.toFixed(0)}ms | Rows: ${newsletterData.length}`
           );
 
           applyFilters();
